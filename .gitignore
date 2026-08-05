@@ -1,1 +1,4 @@
+.*
+__pycache__/
 notebooks/
+mnist_data/
