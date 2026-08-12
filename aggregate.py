@@ -50,15 +50,18 @@ def check_completeness(summary_rows):
 def check_invariants(summary_rows):
     problems = []
 
-    # cold and warm_all train on the same data, so their per-cycle step counts must match.
-    steps = defaultdict(dict)
+    # cold and warm_all must differ ONLY in initialization: same steps, same batch order.
+    cells = defaultdict(dict)
     for r in summary_rows:
         if r["arm"] in ("cold", "warm_all"):
-            steps[(float(r["noise"]), int(r["seed"]), int(r["cycle"]))][r["arm"]] = \
-                int(r["cycle_steps"])
-    for k, d in steps.items():
-        if len(d) == 2 and d["cold"] != d["warm_all"]:
-            problems.append(f"step mismatch at noise/seed/cycle {k}: {d}")
+            key = (float(r["noise"]), float(r["lr"]), int(r["seed"]), int(r["cycle"]))
+            cells[key][r["arm"]] = (int(r["cycle_steps"]), r["batch_order_hash"])
+    for k, d in cells.items():
+        if len(d) == 2:
+            if d["cold"][0] != d["warm_all"][0]:
+                problems.append(f"step-count mismatch at {k}: {d['cold'][0]} vs {d['warm_all'][0]}")
+            if d["cold"][1] != d["warm_all"][1]:
+                problems.append(f"batch-order mismatch at {k} — more than init differs")
 
     unstable = [(r["arm"], r["seed"], r["cycle"]) for r in summary_rows if r["stable"] != "1"]
     if unstable:
@@ -76,7 +79,7 @@ def check_curves(curve_rows, sample=200):
     # NRMSE should increase with lead time; flag configurations where it does not.
     by_run = defaultdict(list)
     for r in curve_rows:
-        key = (r["arm"], r["lr"], r["noise"], r["seed"], r["cycle"], r["epoch"])
+        key = (r["arm"], r["lr"], r["noise"], r["seed"], r["cycle"], r["step"])
         by_run[key].append((int(r["lead_step"]), float(r["nrmse"])))
     bad = []
     for key, pts in list(by_run.items())[:sample]:
@@ -85,6 +88,35 @@ def check_curves(curve_rows, sample=200):
         if v[-1] < v[0]:
             bad.append(key)
     return bad
+
+
+def gap_vs_lead(curve_rows, out_path):
+    # Headline analysis: warm_all minus cold NRMSE vs forecast lead, per seed (never averaged).
+    # Flat in lead => generic init penalty; growing => amplified by chaotic error compounding.
+    by_arm = {}
+    for r in curve_rows:
+        if r["arm"] not in ("cold", "warm_all"):
+            continue
+        # Compare each arm at its own final step of the cycle.
+        key = (float(r["noise"]), float(r["lr"]), int(r["seed"]), int(r["cycle"]),
+               int(r["lead_step"]))
+        slot = by_arm.setdefault(key, {})
+        prev = slot.get(r["arm"])
+        if prev is None or int(r["step"]) >= prev[0]:
+            slot[r["arm"]] = (int(r["step"]), float(r["nrmse"]))
+
+    rows = []
+    for (noise, lr, seed, cycle, lead), d in sorted(by_arm.items()):
+        if len(d) == 2:
+            rows.append(dict(noise=noise, lr=lr, seed=seed, cycle=cycle, lead_step=lead,
+                             lead_mtu=lead * 0.05, lead_hours=lead * 6.0,
+                             lead_lyapunov=lead * 0.05 * 1.671,
+                             cold_nrmse=round(d["cold"][1], 8),
+                             warm_all_nrmse=round(d["warm_all"][1], 8),
+                             gap=round(d["warm_all"][1] - d["cold"][1], 8)))
+    if rows:
+        write_table(out_path, rows, list(rows[0]))
+    return rows
 
 
 def main():
@@ -109,7 +141,7 @@ def main():
 
         for key, grp in sorted(groups.items()):
             grp.sort(key=lambda r: (int(r["seed"]), int(r["cycle"]),
-                                    int(r.get("epoch", 0) or 0),
+                                    int(r.get("step", 0) or 0),
                                     int(r.get("lead_step", 0) or 0)))
             write_table(os.path.join(out_dir, f"{model_name(key)}_{kind}.csv"), grp, cols)
 
@@ -140,6 +172,8 @@ def main():
             if bad:
                 print(f"  WARN {len(bad)} runs where NRMSE does not increase with lead time, "
                       f"e.g. {bad[:2]}")
+            gap_rows = gap_vs_lead(rows, os.path.join(args.results_dir, "gap_vs_lead.csv"))
+            print(f"  gap-vs-lead (headline): {len(gap_rows)} rows -> gap_vs_lead.csv")
 
     print(f"\ntables -> {out_dir}")
     sys.exit(0 if ok else 1)

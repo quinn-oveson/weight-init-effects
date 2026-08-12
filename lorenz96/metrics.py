@@ -8,6 +8,9 @@ from .system import DT
 LAMBDA1 = {3.0: 0.0, 4.0: 0.0, 5.0: 0.523, 6.0: 0.964, 8.0: 1.671,
            10.0: 2.278, 12.0: 2.873, 16.0: 3.849}
 
+# 20 model steps = 1 MTU ~= 2 decorrelation times, so rollout starts are near-independent.
+START_GAP = 20
+
 
 def lambda1(F):
     grid = np.array(sorted(LAMBDA1))
@@ -53,12 +56,16 @@ def valid_prediction_time(pred, truth, threshold=0.3, F=8.0, stride=STRIDE, dt=D
 
 @torch.no_grad()
 def evaluate(model, F=8.0, n_steps=200, n_init=64, seed=0, history=1, sample=False,
-             threshold=0.3, stride=STRIDE, init_noise=0.0):
+             threshold=0.3, stride=STRIDE, init_noise=0.0, start_gap=START_GAP):
     # Initialize from noisy observations (an analysis) but score against clean truth.
     dev = next(model.parameters(), torch.zeros(1)).device
-    truth = rollout_truth(F, n_steps + n_init + history + 2, seed=seed, stride=stride)
+    # Starts are spaced >=1 decorrelation time apart; adjacent starts would be ~1 sample.
+    span = (n_init - 1) * start_gap
+    truth = rollout_truth(F, span + n_steps + history + 2, seed=seed, stride=stride)
     g = torch.Generator().manual_seed(seed)
-    starts = torch.randperm(len(truth) - n_steps - history - 1, generator=g)[:n_init]
+    slack = max(1, len(truth) - n_steps - history - 1 - span)
+    off = int(torch.randint(0, slack, (1,), generator=g))
+    starts = off + torch.arange(n_init) * start_gap
 
     obs = truth if init_noise == 0 else truth + init_noise * torch.randn(
         truth.shape, generator=g)
