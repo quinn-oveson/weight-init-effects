@@ -63,7 +63,8 @@ def decode_task_id(task_id):
 
 
 def resource_tier(cell):
-    return (4, "01:00:00") if cell["frozen"] else (16, "10:00:00")
+    # Deliberately generous for the first run; recalibrate from sacct MaxRSS/Elapsed after.
+    return (16, "06:00:00") if cell["frozen"] else (32, "24:00:00")
 
 
 def device():
@@ -211,7 +212,8 @@ def run_cell(cell, task_id, outdir):
                        os.path.join(C.CKPT_DIR, f"{tag}_cycle{cycle}.pt"))
 
         curve = final_full["curve"].cpu()
-        diag = G.collect(model, stream.val.x[:512].to(dev), init_norms)
+        # 256 probe samples: effective rank runs an SVD on CPU and scales with this.
+        diag = G.collect(model, stream.val.x[:256].to(dev), init_norms)
         mse_n, mse_c = val_losses(model, stream.val, dev)
         w_sum.write(dict(base, cycle=cycle, n_train=n_train, cycle_steps=step, cum_step=cum_step,
                          cum_samples=cum_samples, cycle_wall_s=round(cycle_wall, 3),

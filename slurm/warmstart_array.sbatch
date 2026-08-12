@@ -17,10 +17,18 @@
 # DON'T hand-write --array ranges. Ask for them:
 #   L96_SWEEP=e1e2 python sweep_warmstart.py --print_array_specs
 # For the e1e2 preset that prints two tiers:
-#   mem=16G time=10:00:00 n_tasks=80  --array=0-39,45-84   (cold + warm_all)
-#   mem=4G  time=01:00:00 n_tasks=10  --array=40-44,85-89  (frozen)
+#   mem=32G time=24:00:00 n_tasks=80  --array=0-39,45-84   (cold + warm_all)
+#   mem=16G time=06:00:00 n_tasks=10  --array=40-44,85-89  (frozen)
 # The tiers differ because cold/warm_all train STEP_BUDGET steps every cycle
 # while frozen trains only at cycle 0 and then just evaluates.
+#
+# THESE ARE DELIBERATELY GENEROUS FIRST-RUN VALUES, not measurements. Estimated
+# real cost is well under them (~1-2 GB actual, roughly 35-75 min on a modern
+# GPU), but the true numbers are unknown until this runs once. After the first
+# submission, read actual usage off
+#   sacct -j <jobid> --format=JobID,MaxRSS,Elapsed,State
+# and tighten resource_tier() in sweep_warmstart.py. Over-requesting only costs
+# queue time; under-requesting costs the whole run.
 #
 # Budget is in optimizer STEPS, not epochs: arms and cycles see different
 # dataset sizes, so an equal epoch cap would be an up-to-86x difference in
@@ -30,8 +38,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus=1
-#SBATCH --mem=16G             # PLACEHOLDER -- override per tier at submission.
-#SBATCH --time=10:00:00       # PLACEHOLDER -- override per tier at submission.
+#SBATCH --mem=32G             # Generous first-run default; recalibrate from sacct.
+#SBATCH --time=24:00:00       # Generous first-run default; recalibrate from sacct.
 #SBATCH --array=0-89          # PLACEHOLDER -- override with the ranges above.
 #SBATCH -J l96_warmstart
 #SBATCH --output=slurm_logs/warmstart_%A_%a.out
@@ -74,20 +82,22 @@ python sweep_warmstart.py --task_id "$SLURM_ARRAY_TASK_ID"
 # 1. Calibrate ONE task of EACH tier first -- their cost profiles are unrelated,
 #    so timing one tells you nothing about the other:
 #      mkdir -p slurm_logs
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=0  --time=10:00:00 --mem=16G slurm/warmstart_array.sbatch
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=40 --time=01:00:00 --mem=4G  slurm/warmstart_array.sbatch
+#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=0  --time=24:00:00 --mem=32G slurm/warmstart_array.sbatch
+#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=40 --time=06:00:00 --mem=16G slurm/warmstart_array.sbatch
 #    task 0  = cold,   noise 0.05, seed 0  (trains every cycle, the expensive tier)
 #    task 40 = frozen, noise 0.05, seed 0  (trains cycle 0 only)
 #    Watch with:  squeue -u $USER
 #    Then check ACTUAL usage:  sacct -j <jobid> --format=JobID,MaxRSS,Elapsed,State
-#    The --mem/--time above are estimates, not measurements. Adjust before step 2.
+#    The --mem/--time above are generous guesses, not measurements. The POINT of
+#    this step is to replace them: record Elapsed and MaxRSS for both tiers, then
+#    set resource_tier() from measured values plus margin for later sweeps.
 #
 # 2. Once both succeed and the CSVs look right, submit the full tiers. Send the
 #    expensive tier first at normal priority and the cheap tier after with a
 #    higher --nice, so the long jobs are not stuck behind short ones when the
 #    concurrent-node budget is tight:
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=0-39,45-84 --time=10:00:00 --mem=16G           slurm/warmstart_array.sbatch
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=40-44,85-89 --time=01:00:00 --mem=4G --nice=100 slurm/warmstart_array.sbatch
+#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=0-39,45-84 --time=24:00:00 --mem=32G           slurm/warmstart_array.sbatch
+#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=40-44,85-89 --time=06:00:00 --mem=16G --nice=100 slurm/warmstart_array.sbatch
 #
 # 3. Aggregate into per-model-type tables once everything finishes:
 #      python aggregate.py
