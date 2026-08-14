@@ -40,12 +40,14 @@ def _load(n, seed, noise, history, F):
 class CycleStream:
     # Data arriving in equal chunks, with fixed held-out val/test from separate trajectories.
     def __init__(self, seed=0, noise=0.05, n_cycles=10, chunk=2_000, n_val=4_000,
-                 history=4, F=REFERENCE_F):
+                 history=4, F=REFERENCE_F, n_test=None):
         self.seed, self.noise, self.n_cycles, self.chunk = seed, noise, n_cycles, chunk
         self.history, self.F = history, F
 
         self.val = _load(n_val, seed + VAL_SEED_OFFSET, noise, history, F)
+        # Shares the rollout initial conditions' trajectory; only ever reported, never selected on.
         self.test_seed = seed + TEST_SEED_OFFSET
+        self.test = _load(n_test or n_val, self.test_seed, noise, history, F)
         self._chunks = [_load(chunk, seed * 31 + c, noise, history, F) for c in range(n_cycles)]
 
     def cycle_data(self, cycle, data_all):
@@ -57,9 +59,10 @@ class CycleStream:
         return derive_seeds(self.seed, cycle)
 
     def assert_no_leakage(self):
-        # Val must not appear in any chunk; independent trajectories make exact matches vanishing.
-        vh = {hash(r.numpy().tobytes()) for r in self.val.x[:256]}
-        for c, ch in enumerate(self._chunks):
-            hits = vh & {hash(r.numpy().tobytes()) for r in ch.x}
-            assert not hits, f"validation window found in training chunk {c}"
+        # Val/test must not appear in any chunk.
+        for name, split in (("validation", self.val), ("test", self.test)):
+            h = {hash(r.numpy().tobytes()) for r in split.x[:256]}
+            for c, ch in enumerate(self._chunks):
+                hits = h & {hash(r.numpy().tobytes()) for r in ch.x}
+                assert not hits, f"{name} window found in training chunk {c}"
         return True

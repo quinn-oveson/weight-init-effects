@@ -16,31 +16,55 @@
 #
 # DON'T hand-write --array ranges. Ask for them:
 #   L96_SWEEP=e1e2 python sweep_warmstart.py --print_array_specs
-# For the e1e2 preset that prints two tiers:
-#   mem=32G time=24:00:00 n_tasks=80  --array=0-39,45-84   (cold + warm_all)
-#   mem=16G time=06:00:00 n_tasks=10  --array=40-44,85-89  (frozen)
-# The tiers differ because cold/warm_all train STEP_BUDGET steps every cycle
-# while frozen trains only at cycle 0 and then just evaluates.
-#
-# THESE ARE DELIBERATELY GENEROUS FIRST-RUN VALUES, not measurements. Estimated
-# real cost is well under them (~1-2 GB actual, roughly 35-75 min on a modern
-# GPU), but the true numbers are unknown until this runs once. After the first
-# submission, read actual usage off
-#   sacct -j <jobid> --format=JobID,MaxRSS,Elapsed,State
-# and tighten resource_tier() in sweep_warmstart.py. Over-requesting only costs
-# queue time; under-requesting costs the whole run.
+# One tier covers every cell: 8G and 00:30:00, from the measured 3.0 min/cell at
+# 10 cycles and MaxRSS 1.3-2.1GB on the first run.
 #
 # Budget is in optimizer STEPS, not epochs: arms and cycles see different
 # dataset sizes, so an equal epoch cap would be an up-to-86x difference in
 # gradient steps and would corrupt every compute comparison.
+#
+# ---------------------------------------------------------------------------
+# GPU SELECTION (pass at submission; deliberately NOT a #SBATCH line here,
+# because node names drift and a stale hardcoded list is worse than none)
+#
+# Public GPU capacity on this cluster is dominated by P100s:
+#   m9g-1-[1-20], m9g-2-[1-20]   gpu:p100:4   = 160 GPUs   (features: public,gpu,pascal)
+#   m13h-1-[1-2], m13h-2-[1-2]   gpu:h200:8   =  32 GPUs   (feature: hopper)
+#   m13l-1-[1-2], m13l-2-[1-2]   gpu:l40s:4   =  16 GPUs   (feature: lovelace)
+#   cs-*, dw-*, eng-1-1, msg-1-1  a100/h100/b200/v100 -- all tagged PRIVATE
+#   mgh-1-[1-2]                  gpu:gh200:1  -- ARM, x86 conda env will not run
+#   m8g-1-5                      gpu:4        -- untyped GRES, unknown hardware
+#
+# NOTE: m13h/m13l do NOT carry the `gpu` feature, so --constraint=gpu would
+# exclude exactly the fast nodes.
+#
+# USE THIS -- fast nodes only, positive selection, fails loudly if unavailable:
+#       --constraint='hopper|lovelace'
+#
+# Rationale: measured experience on this cluster is that P100s cost more wall
+# time than the extra queue wait for a bigger GPU. That holds doubly for this
+# job, because m9g nodes are BROADWELL-era CPUs and a meaningful part of the
+# work is CPU-bound regardless of GPU -- ~150k NumPy RK4 integration steps per
+# task plus 10 CPU-side SVDs for effective rank. A faster GPU cannot hide those.
+#
+# Fallback if m13h/m13l turn out to be unschedulable for this account
+# (they carry neither a `public` nor `private` tag, so access is unconfirmed):
+#       --exclude=m9g-1-[1-20],m9g-2-[1-20],mgh-1-[1-2],m8g-1-5
+# That avoids Pascal, ARM (x86 env will not run), and the untyped m8g-1-5,
+# while still allowing anything else the account can reach.
+#
+# Aside, only relevant if Pascal is ever reconsidered: CUDA 13.x dropped sm_60
+# entirely, so check `python -c "import torch; print(torch.cuda.get_arch_list())"`
+# before assuming a P100 would even run.
+# ---------------------------------------------------------------------------
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=1     # Nothing here is CPU-parallel; 1 core schedules sooner.
 #SBATCH --gpus=1
-#SBATCH --mem=32G             # Generous first-run default; recalibrate from sacct.
-#SBATCH --time=24:00:00       # Generous first-run default; recalibrate from sacct.
-#SBATCH --array=0-89          # PLACEHOLDER -- override with the ranges above.
+#SBATCH --mem=8G
+#SBATCH --time=00:30:00
+#SBATCH --array=0-239         # PLACEHOLDER -- confirm with --print_array_specs.
 #SBATCH -J l96_warmstart
 #SBATCH --output=slurm_logs/warmstart_%A_%a.out
 #SBATCH --error=slurm_logs/warmstart_%A_%a.err
@@ -79,33 +103,21 @@ python sweep_warmstart.py --task_id "$SLURM_ARRAY_TASK_ID"
 # at runtime, so compute nodes need no outbound internet and no dataset copy.
 #
 # ROLLOUT
-# 1. Calibrate ONE task of EACH tier first -- their cost profiles are unrelated,
-#    so timing one tells you nothing about the other:
+# 1. Submit the whole array in one go:
 #      mkdir -p slurm_logs
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=0  --time=24:00:00 --mem=32G slurm/warmstart_array.sbatch
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=40 --time=06:00:00 --mem=16G slurm/warmstart_array.sbatch
-#    task 0  = cold,   noise 0.05, seed 0  (trains every cycle, the expensive tier)
-#    task 40 = frozen, noise 0.05, seed 0  (trains cycle 0 only)
+#      sbatch --export=ALL,L96_SWEEP=e1e2b --constraint='hopper|lovelace' \
+#             --array=0-239 slurm/warmstart_array.sbatch
 #    Watch with:  squeue -u $USER
-#    Then check ACTUAL usage:  sacct -j <jobid> --format=JobID,MaxRSS,Elapsed,State
-#    The --mem/--time above are generous guesses, not measurements. The POINT of
-#    this step is to replace them: record Elapsed and MaxRSS for both tiers, then
-#    set resource_tier() from measured values plus margin for later sweeps.
 #
-# 2. Once both succeed and the CSVs look right, submit the full tiers. Send the
-#    expensive tier first at normal priority and the cheap tier after with a
-#    higher --nice, so the long jobs are not stuck behind short ones when the
-#    concurrent-node budget is tight:
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=0-39,45-84 --time=24:00:00 --mem=32G           slurm/warmstart_array.sbatch
-#      sbatch --export=ALL,L96_SWEEP=e1e2 --array=40-44,85-89 --time=06:00:00 --mem=16G --nice=100 slurm/warmstart_array.sbatch
-#
-# 3. Aggregate into per-model-type tables once everything finishes:
+# 2. Aggregate into per-model-type tables once everything finishes:
 #      python aggregate.py
 #
 # RE-RUNNING FAILURES
 # Tasks are independent and each writes only its own results/<preset>/task<NNN>_*.csv,
-# so a failed task can be resubmitted alone with --array=<id>. Delete that task's
-# three CSVs first -- Writer appends, so a re-run without deleting would duplicate rows.
+# so a failed or PREEMPTED task can simply be resubmitted with --array=<id>.
+# Writer truncates on open, so a re-run rewrites that task's CSVs cleanly -- no
+# need to delete anything first, and automatic requeue under a preemptible QOS
+# is safe.
 # Per-cycle checkpoints land in results/<preset>/ckpt/ (warm_all only, ~4.2 GB total);
 # the deferred shrink-and-perturb sweep branches from these instead of replaying chains.
 # ============================================================================

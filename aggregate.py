@@ -6,6 +6,11 @@ import sys
 from collections import Counter, defaultdict
 
 import sweep_config as C
+from lorenz96.data import STRIDE
+from lorenz96.metrics import lambda1
+from lorenz96.system import DT
+
+LAM = lambda1(C.F)
 
 KINDS = ("training", "curves", "summary")
 
@@ -63,15 +68,29 @@ def check_invariants(summary_rows):
             if d["cold"][1] != d["warm_all"][1]:
                 problems.append(f"batch-order mismatch at {k} — more than init differs")
 
+    # The ramp only measures warm-starting if it finishes before the optimum.
+    ramp = [r for r in summary_rows if r["arm"].endswith("_lr_ramp") and r.get("step_of_best")]
+    if ramp:
+        inside = sum(1 for r in ramp if int(r["step_of_best"]) < C.WARMUP_STEPS)
+        problems.append(f"INFO {inside}/{len(ramp)} lr-ramp cycles peaked inside the "
+                        f"{C.WARMUP_STEPS}-step warmup -- shorten WARMUP_STEPS if most did")
+
     unstable = [(r["arm"], r["seed"], r["cycle"]) for r in summary_rows if r["stable"] != "1"]
     if unstable:
         problems.append(f"{len(unstable)} unstable rollouts, e.g. {unstable[:3]}")
 
-    gaps = [float(r["final_train_val_gap"]) for r in summary_rows]
-    if gaps:
-        problems.append(f"INFO train_val_gap range [{min(gaps):+.5f}, {max(gaps):+.5f}] "
-                        f"-- if never positive, the model is not overfitting and the "
-                        f"phenomenon cannot appear")
+    # Must be an eval()-mode train MSE: final_train_val_gap degenerates to val error alone.
+    col = ("final_gen_gap_clean" if any(r.get("final_gen_gap_clean") for r in summary_rows)
+           else None)
+    if col is None:
+        problems.append("INFO no final_gen_gap_clean column -- overfitting cannot be "
+                        "checked on this sweep; re-run to log train/test MSE")
+    else:
+        gaps = [float(r[col]) for r in summary_rows if r.get(col) not in (None, "")]
+        if gaps:
+            problems.append(f"INFO gen_gap_clean (val - train) range "
+                            f"[{min(gaps):+.5f}, {max(gaps):+.5f}] -- if never positive, "
+                            f"the model is not overfitting and the phenomenon cannot appear")
     return problems
 
 
@@ -79,7 +98,9 @@ def check_curves(curve_rows, sample=200):
     # NRMSE should increase with lead time; flag configurations where it does not.
     by_run = defaultdict(list)
     for r in curve_rows:
-        key = (r["arm"], r["lr"], r["noise"], r["seed"], r["cycle"], r["step"])
+        # In the key because a "best" curve can share a step with an "eval" curve.
+        key = (r["arm"], r["lr"], r["noise"], r["seed"], r["cycle"], r["step"],
+               r.get("curve_basis", "eval"))
         by_run[key].append((int(r["lead_step"]), float(r["nrmse"])))
     bad = []
     for key, pts in list(by_run.items())[:sample]:
@@ -90,30 +111,58 @@ def check_curves(curve_rows, sample=200):
     return bad
 
 
-def gap_vs_lead(curve_rows, out_path):
-    # Headline analysis: warm_all minus cold NRMSE vs forecast lead, per seed (never averaged).
-    # Flat in lead => generic init penalty; growing => amplified by chaotic error compounding.
-    by_arm = {}
+def gap_vs_lead(curve_rows, summary_rows, out_path):
+    # Per-seed warm_all-minus-cold NRMSE vs lead on both bases; never compare on "final" alone.
+    best_step = {}
+    for r in summary_rows:
+        key = (r["arm"], float(r["noise"]), float(r["lr"]), int(r["seed"]), int(r["cycle"]))
+        best_step[key] = int(r["step_of_best"])
+
+    # curve_basis="best" carries an exact handoff curve; older sweeps must snap to nearest.
+    curves = defaultdict(lambda: defaultdict(dict))
+    exact = defaultdict(dict)
     for r in curve_rows:
         if r["arm"] not in ("cold", "warm_all"):
             continue
-        # Compare each arm at its own final step of the cycle.
-        key = (float(r["noise"]), float(r["lr"]), int(r["seed"]), int(r["cycle"]),
-               int(r["lead_step"]))
-        slot = by_arm.setdefault(key, {})
-        prev = slot.get(r["arm"])
-        if prev is None or int(r["step"]) >= prev[0]:
-            slot[r["arm"]] = (int(r["step"]), float(r["nrmse"]))
+        key = (r["arm"], float(r["noise"]), float(r["lr"]), int(r["seed"]), int(r["cycle"]))
+        if r.get("curve_basis") == "best":
+            exact[key][int(r["lead_step"])] = float(r["nrmse"])
+        else:
+            curves[key][int(r["step"])][int(r["lead_step"])] = float(r["nrmse"])
 
+    def pick(key, basis):
+        if basis == "best" and key in exact:
+            return best_step.get(key), exact[key]
+        steps = sorted(curves.get(key, {}))
+        if not steps:
+            return None, None
+        if basis == "final":
+            chosen = steps[-1]
+        else:
+            target = best_step.get(key)
+            if target is None:
+                return None, None
+            chosen = min(steps, key=lambda st: abs(st - target))
+        return chosen, curves[key][chosen]
+
+    cells = {k[1:] for k in curves if k[0] == "cold"} & {k[1:] for k in curves if k[0] == "warm_all"}
     rows = []
-    for (noise, lr, seed, cycle, lead), d in sorted(by_arm.items()):
-        if len(d) == 2:
-            rows.append(dict(noise=noise, lr=lr, seed=seed, cycle=cycle, lead_step=lead,
-                             lead_mtu=lead * 0.05, lead_hours=lead * 6.0,
-                             lead_lyapunov=lead * 0.05 * 1.671,
-                             cold_nrmse=round(d["cold"][1], 8),
-                             warm_all_nrmse=round(d["warm_all"][1], 8),
-                             gap=round(d["warm_all"][1] - d["cold"][1], 8)))
+    for basis in ("best", "final"):
+        for noise, lr, seed, cycle in sorted(cells):
+            s_c, c_cold = pick(("cold", noise, lr, seed, cycle), basis)
+            s_w, c_warm = pick(("warm_all", noise, lr, seed, cycle), basis)
+            if c_cold is None or c_warm is None:
+                continue
+            for lead in sorted(set(c_cold) & set(c_warm)):
+                mtu = lead * STRIDE * DT
+                rows.append(dict(basis=basis, noise=noise, lr=lr, seed=seed, cycle=cycle,
+                                 lead_step=lead, lead_mtu=round(mtu, 8),
+                                 lead_hours=round(mtu * 120.0, 8),
+                                 lead_lyapunov=round(mtu * LAM, 8),
+                                 cold_step=s_c, warm_all_step=s_w,
+                                 cold_nrmse=round(c_cold[lead], 8),
+                                 warm_all_nrmse=round(c_warm[lead], 8),
+                                 gap=round(c_warm[lead] - c_cold[lead], 8)))
     if rows:
         write_table(out_path, rows, list(rows[0]))
     return rows
@@ -172,8 +221,12 @@ def main():
             if bad:
                 print(f"  WARN {len(bad)} runs where NRMSE does not increase with lead time, "
                       f"e.g. {bad[:2]}")
-            gap_rows = gap_vs_lead(rows, os.path.join(args.results_dir, "gap_vs_lead.csv"))
-            print(f"  gap-vs-lead (headline): {len(gap_rows)} rows -> gap_vs_lead.csv")
+            srows, _ = read_tasks(args.results_dir, "summary")
+            gap_rows = gap_vs_lead(rows, srows,
+                                   os.path.join(args.results_dir, "gap_vs_lead.csv"))
+            n_best = sum(1 for r in gap_rows if r["basis"] == "best")
+            print(f"  gap-vs-lead (headline): {len(gap_rows)} rows "
+                  f"({n_best} best-stopped, {len(gap_rows)-n_best} final) -> gap_vs_lead.csv")
 
     print(f"\ntables -> {out_dir}")
     sys.exit(0 if ok else 1)

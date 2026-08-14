@@ -5,3 +5,7 @@ mnist_data/
 results/smoke/
 results/*/ckpt/
 results/capacity_check.csv
+results/fake/
+results/partial/
+results/handoff_test/
+figures/e1e2/

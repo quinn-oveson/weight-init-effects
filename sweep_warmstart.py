@@ -12,22 +12,25 @@ from lorenz96 import diagnostics as G
 from lorenz96 import metrics as M
 from lorenz96.data import STRIDE
 from lorenz96.models import CircularCNN, count_params
-from lorenz96.stream import CycleStream
+from lorenz96.stream import CycleStream, Split
 from lorenz96.system import DT
 
 HOURS_PER_MTU = 120.0
 
-CONFIG_COLS = ["arm", "warm_start", "data_all", "frozen", "lr", "noise", "hidden", "n_layers",
+CONFIG_COLS = ["arm", "warm_start", "data_all", "frozen", "warmup", "lr", "noise", "hidden",
+               "n_layers",
                "kernel", "history", "batch_size", "step_budget", "F", "n_params", "seed",
                "data_seed", "noise_seed", "init_seed", "shuffle_seed"]
 
 TRAINING_COLS = CONFIG_COLS + [
+    # train_loss/train_val_gap are optimization quantities; train_mse_*/test_mse_* measure this checkpoint.
     "cycle", "step", "cum_step", "cum_samples", "cycle_wall_s", "n_train", "train_loss",
-    "val_mse_noisy", "val_mse_clean", "train_val_gap", "valid_time_mtu", "valid_time_lyap",
-    "weight_norm"]
+    "val_mse_noisy", "val_mse_clean", "train_val_gap", "train_mse_noisy", "train_mse_clean",
+    "test_mse_noisy", "test_mse_clean", "valid_time_mtu", "valid_time_lyap", "weight_norm"]
 
 CURVE_COLS = CONFIG_COLS + [
-    "cycle", "step", "cum_step", "lead_step", "lead_hours", "lead_mtu", "lead_lyapunov", "nrmse"]
+    "cycle", "step", "cum_step", "curve_basis", "lead_step", "lead_hours", "lead_mtu",
+    "lead_lyapunov", "nrmse"]
 
 
 def _template_model():
@@ -40,8 +43,16 @@ DIAG_COLS = G.diagnostic_columns(_template_model())
 SUMMARY_COLS = CONFIG_COLS + [
     "cycle", "n_train", "cycle_steps", "cum_step", "cum_samples", "cycle_wall_s",
     "final_train_loss", "final_val_mse_noisy", "final_val_mse_clean", "final_train_val_gap",
-    "best_val_mse_clean", "step_of_best", "rollout_std", "truth_std", "stable",
-    "batch_order_hash"] + [f"vt_mtu@{t}" for t in C.THRESHOLDS] + DIAG_COLS
+    "best_val_mse_clean", "step_of_best", "best_at_boundary",
+    # best_* is the handoff checkpoint, final_* the end-of-budget model.
+    "best_train_mse_clean", "best_test_mse_noisy", "best_test_mse_clean",
+    "final_train_mse_clean", "final_test_mse_noisy", "final_test_mse_clean",
+    "final_gen_gap_clean",
+    "rollout_std", "truth_std", "stable", "batch_order_hash"] + [
+    # vt_mtu@*/stable are end-of-budget; vt_best_mtu@*/best_stable are the handoff model.
+    f"vt_mtu@{t}" for t in C.THRESHOLDS] + [
+    f"vt_best_mtu@{t}" for t in C.THRESHOLDS] + [
+    "best_rollout_std", "best_stable"] + DIAG_COLS
 
 
 def slurm_ranges(ids):
@@ -63,8 +74,8 @@ def decode_task_id(task_id):
 
 
 def resource_tier(cell):
-    # Deliberately generous for the first run; recalibrate from sacct MaxRSS/Elapsed after.
-    return (16, "06:00:00") if cell["frozen"] else (32, "24:00:00")
+    # One tier for every cell: measured MaxRSS 1.3-2.1GB and ~6 min at 20 cycles.
+    return (8, "00:30:00")
 
 
 def device():
@@ -74,13 +85,12 @@ def device():
 
 
 class Writer:
+    # Truncate, not append: each task owns its files, so re-runs rewrite cleanly.
     def __init__(self, path, cols):
         self.cols = cols
-        new = not os.path.exists(path)
-        self.fh = open(path, "a", newline="")
+        self.fh = open(path, "w", newline="")
         self.w = csv.DictWriter(self.fh, fieldnames=cols, extrasaction="ignore")
-        if new:
-            self.w.writeheader()
+        self.w.writeheader()
 
     def write(self, row):
         # Round floats so binary-representation noise never reaches the CSV.
@@ -91,12 +101,20 @@ class Writer:
         self.fh.close()
 
 
+def warmup_lr(step, lr, n=None, factor=None):
+    # Geometric, not linear: the first Adam step moves every parameter by ~lr.
+    n = C.WARMUP_STEPS if n is None else n
+    factor = C.WARMUP_FACTOR if factor is None else factor
+    return lr if step >= n or n <= 0 else lr / factor ** (1.0 - step / n)
+
+
 @torch.no_grad()
-def val_losses(model, val, dev):
+def split_losses(model, split, dev):
+    # Returns (MSE vs noisy target, MSE vs clean target) for one held-out or train split.
     model.eval()
-    pred = model(val.x.to(dev))
-    return (float(nn.functional.mse_loss(pred, val.y.to(dev))),
-            float(nn.functional.mse_loss(pred, val.y_clean.to(dev))))
+    pred = model(split.x.to(dev))
+    return (float(nn.functional.mse_loss(pred, split.y.to(dev))),
+            float(nn.functional.mse_loss(pred, split.y_clean.to(dev))))
 
 
 def valid_time(curve, threshold):
@@ -143,15 +161,31 @@ def run_cell(cell, task_id, outdir):
         opt = torch.optim.Adam(model.parameters(), lr=cell["lr"])
         g = torch.Generator().manual_seed(seeds["shuffle_seed"])
 
+        # Skipped at cycle 0, where nothing is inherited and every arm must agree.
+        ramping = bool(cell.get("warmup")) and cycle > 0
         step, run_loss, n_batch, order_hash = 0, 0.0, 0, ""
-        best_clean, best_step = float("inf"), -1
+        best_clean, best_step, best_state = float("inf"), -1, None
+        best_extra, last_train_loss = {}, float("nan")
         t0 = time.time()
 
-        def do_eval(step, train_loss, force_curve=False):
-            nonlocal best_clean, best_step
-            mse_n, mse_c = val_losses(model, stream.val, dev)
-            if mse_c < best_clean:
+        # Fixed subsample so the train-MSE curve is comparable across steps within a cycle.
+        g_tr = torch.Generator().manual_seed(seeds["shuffle_seed"] + 1)
+        tr_idx = torch.randperm(n_train, generator=g_tr)[:min(C.N_VAL, n_train)]
+        train_eval = Split(data.x[tr_idx], data.y[tr_idx], data.y_clean[tr_idx])
+
+        def do_eval(step, train_loss, force_curve=False, select=True):
+            nonlocal best_clean, best_step, best_state, best_extra
+            mse_n, mse_c = split_losses(model, stream.val, dev)
+            tr_n, tr_c = split_losses(model, train_eval, dev)
+            te_n, te_c = split_losses(model, stream.test, dev)
+            if select and mse_c < best_clean:
                 best_clean, best_step = mse_c, step
+                # Recorded at the val-selected checkpoint, never selected on.
+                best_extra = dict(best_train_mse_clean=tr_c, best_test_mse_noisy=te_n,
+                                  best_test_mse_clean=te_c)
+                # Keep a CPU copy so the next cycle warm-starts from the deployable model.
+                best_state = {k: v.detach().to("cpu", copy=True)
+                              for k, v in model.state_dict().items()}
             r = M.evaluate(model, F=C.F, n_steps=C.ROLLOUT_STEPS, n_init=C.ROLLOUT_INITS_EVAL,
                            seed=stream.test_seed, history=C.HISTORY, init_noise=cell["noise"])
             wn = float(sum(v ** 2 for v in G.layer_norms(model).values()) ** 0.5)
@@ -159,7 +193,9 @@ def run_cell(cell, task_id, outdir):
                                cum_samples=cum_samples + step * C.BATCH_SIZE,
                                cycle_wall_s=round(time.time() - t0, 3), n_train=n_train,
                                train_loss=train_loss, val_mse_noisy=mse_n, val_mse_clean=mse_c,
-                               train_val_gap=mse_n - train_loss, valid_time_mtu=r["mtu"],
+                               train_val_gap=mse_n - train_loss, train_mse_noisy=tr_n,
+                               train_mse_clean=tr_c, test_mse_noisy=te_n, test_mse_clean=te_c,
+                               valid_time_mtu=r["mtu"],
                                valid_time_lyap=r["lyapunov_times"], weight_norm=wn))
             if force_curve or step in curve_points:
                 full = M.evaluate(model, F=C.F, n_steps=C.ROLLOUT_STEPS,
@@ -168,7 +204,8 @@ def run_cell(cell, task_id, outdir):
                 for s, v in enumerate(full["curve"].cpu().tolist()):
                     mtu = (s + 1) * STRIDE * DT
                     w_curve.write(dict(base, cycle=cycle, step=step, cum_step=cum_step + step,
-                                       lead_step=s + 1, lead_hours=mtu * HOURS_PER_MTU,
+                                       curve_basis="eval", lead_step=s + 1,
+                                       lead_hours=mtu * HOURS_PER_MTU,
                                        lead_mtu=mtu, lead_lyapunov=mtu * lam, nrmse=v))
                 return full
             return None
@@ -176,8 +213,9 @@ def run_cell(cell, task_id, outdir):
         curve_points = set(C.EVAL_STEPS[::C.CURVE_EVERY])
         final_full = None
 
-        if budget == 0:
-            final_full = do_eval(0, float("nan"), force_curve=True)
+        # select=False logs the starting model without making it a selectable checkpoint.
+        final_full = do_eval(0, float("nan"), force_curve=(budget == 0),
+                             select=(budget == 0))
         while step < budget:
             perm = torch.randperm(n_train, generator=g)
             if step == 0:
@@ -187,6 +225,9 @@ def run_cell(cell, task_id, outdir):
             # drop_last keeps every gradient step identical in size, so steps are exactly ~FLOPs.
             for i in range(0, n_train - C.BATCH_SIZE + 1, C.BATCH_SIZE):
                 idx = perm[i:i + C.BATCH_SIZE]
+                if ramping:
+                    for gp in opt.param_groups:
+                        gp["lr"] = warmup_lr(step, cell["lr"])
                 loss = nn.functional.mse_loss(model(x[idx]), y[idx])
                 opt.zero_grad()
                 loss.backward()
@@ -195,7 +236,9 @@ def run_cell(cell, task_id, outdir):
                 n_batch += 1
                 step += 1
                 if step in eval_set or step == budget:
-                    out = do_eval(step, run_loss / max(n_batch, 1), force_curve=(step == budget))
+                    # Before the reset: reading it after leaves n_batch == 0 and reports NaN.
+                    last_train_loss = run_loss / max(n_batch, 1)
+                    out = do_eval(step, last_train_loss, force_curve=(step == budget))
                     final_full = out or final_full
                     run_loss, n_batch = 0.0, 0
                     model.train()
@@ -206,24 +249,53 @@ def run_cell(cell, task_id, outdir):
         cum_step += step
         cum_samples += step * C.BATCH_SIZE
 
+        # Before swapping in handoff weights, so final_* keeps meaning "final".
+        mse_n, mse_c = split_losses(model, stream.val, dev)
+        f_tr_n, f_tr_c = split_losses(model, train_eval, dev)
+        f_te_n, f_te_c = split_losses(model, stream.test, dev)
+        curve = final_full["curve"].cpu()
+
+        # Hand forward the best-validation weights, not the end-of-budget (overfit) ones.
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        boundary = int(best_step > 0 and step < 3 * best_step)
+
+        # Exact handoff curve; otherwise best-stopped analysis snaps with ~35% step error.
+        best_full = M.evaluate(model, F=C.F, n_steps=C.ROLLOUT_STEPS, n_init=C.ROLLOUT_INITS,
+                               seed=stream.test_seed, history=C.HISTORY,
+                               init_noise=cell["noise"])
+        best_curve = best_full["curve"].cpu()
+        for s, v in enumerate(best_curve.tolist()):
+            mtu = (s + 1) * STRIDE * DT
+            w_curve.write(dict(base, cycle=cycle, step=best_step,
+                               cum_step=cum_step - step + best_step, curve_basis="best",
+                               lead_step=s + 1, lead_hours=mtu * HOURS_PER_MTU,
+                               lead_mtu=mtu, lead_lyapunov=mtu * lam, nrmse=v))
+
         if save_ckpt:
             os.makedirs(C.CKPT_DIR, exist_ok=True)
-            torch.save(model.state_dict(),
+            torch.save(best_state if best_state is not None else model.state_dict(),
                        os.path.join(C.CKPT_DIR, f"{tag}_cycle{cycle}.pt"))
 
-        curve = final_full["curve"].cpu()
-        # 256 probe samples: effective rank runs an SVD on CPU and scales with this.
+        # Diagnostics describe the HANDOFF model -- that is what the chain propagates.
         diag = G.collect(model, stream.val.x[:256].to(dev), init_norms)
-        mse_n, mse_c = val_losses(model, stream.val, dev)
         w_sum.write(dict(base, cycle=cycle, n_train=n_train, cycle_steps=step, cum_step=cum_step,
                          cum_samples=cum_samples, cycle_wall_s=round(cycle_wall, 3),
-                         final_train_loss=run_loss / max(n_batch, 1) if n_batch else float("nan"),
+                         final_train_loss=last_train_loss,
                          final_val_mse_noisy=mse_n, final_val_mse_clean=mse_c,
-                         final_train_val_gap=mse_n - (run_loss / n_batch if n_batch else 0.0),
+                         final_train_val_gap=mse_n - last_train_loss,
+                         final_train_mse_clean=f_tr_c, final_test_mse_noisy=f_te_n,
+                         final_test_mse_clean=f_te_c, final_gen_gap_clean=mse_c - f_tr_c,
+                         **best_extra,
                          best_val_mse_clean=best_clean, step_of_best=best_step,
+                         best_at_boundary=boundary,
                          rollout_std=final_full["pred_std"], truth_std=final_full["truth_std"],
                          stable=int(final_full["stable"]), batch_order_hash=order_hash,
-                         **{f"vt_mtu@{t}": valid_time(curve, t) for t in C.THRESHOLDS}, **diag))
+                         **{f"vt_mtu@{t}": valid_time(curve, t) for t in C.THRESHOLDS},
+                         **{f"vt_best_mtu@{t}": valid_time(best_curve, t)
+                            for t in C.THRESHOLDS},
+                         best_rollout_std=best_full["pred_std"],
+                         best_stable=int(best_full["stable"]), **diag))
 
         print(f"  cycle {cycle}: n={n_train} steps={step} val_clean={mse_c:.5f} "
               f"best={best_clean:.5f}@{best_step} gap={mse_n - mse_c:+.5f} "
